@@ -2,7 +2,7 @@
 
 🚧 **Work In Progress**: 이 프로젝트는 현재 활발히 개발 및 개선 중이며, 지속적으로 커밋이 추가될 예정입니다. 🚧
 
-Doosan E0509 로봇에서 **ROS 2 환경과 ROBOTIS RH-P12-RN 그리퍼 간의 양방향 제어(Read/Write)**를 구현하기 위한 TCP 통신 브리지 및 실시간 모니터링 대시보드 프로젝트입니다.
+Doosan E0509 로봇에서 <b>ROS 2 환경과 ROBOTIS RH-P12-RN 그리퍼 간의 양방향 제어(Read/Write)</b>를 구현하기 위한 TCP 통신 브리지 및 실시간 모니터링 대시보드 프로젝트입니다.
 
 ---
 
