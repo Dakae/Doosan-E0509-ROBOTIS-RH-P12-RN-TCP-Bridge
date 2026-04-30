@@ -1,44 +1,70 @@
 # Doosan E0509 - ROBOTIS RH-P12-RN TCP Bridge
 
-ROS 2 control bridge for a **ROBOTIS RH-P12-RN(A) gripper** mounted on a
-**Doosan E0509** robot.
+[English](./README.md) | [한국어](./README.ko.md)
 
-This project runs a DRL-side TCP server on the Doosan controller and exposes the
-gripper to ROS 2 as reusable Python nodes, services, topics, and an action
-interface. It also includes a Flask/SocketIO web dashboard for live monitoring
-and manual control.
+---
 
-> The previous standalone Python prototype is preserved under `old/`. The main
-> implementation is now the ROS 2 package layout under `dsr_gripper_tcp/` and
-> `dsr_gripper_tcp_interfaces/`.
+## Introduction
 
-## Why This Exists
+This repository provides a ROS 2 TCP bridge for controlling and monitoring a
+**ROBOTIS RH-P12-RN(A)** gripper mounted on a **Doosan E0509** robot.
 
-On the target E0509 setup, direct DRL/ROS 2 integration was not enough for
-reliable gripper state feedback. The bridge solves this by:
+The project runs a DRL-side TCP server on the Doosan controller, communicates
+with the gripper through flange RS-485 Modbus RTU, and exposes the gripper to
+ROS 2 as reusable nodes, topics, services, and an action interface.
 
-- starting a DRL TCP server on the Doosan controller,
-- communicating with the RH-P12-RN(A) over flange serial Modbus RTU inside DRL,
-- sending command/response packets between ROS 2 and DRL over a lightweight TCP
-  binary protocol,
-- exposing state and commands through ROS 2 service/action/topic interfaces.
+The original standalone Python prototype is preserved under `old/`. The main
+implementation is now the ROS 2 package layout under:
 
-## Features
+- `dsr_gripper_tcp/`
+- `dsr_gripper_tcp_interfaces/`
 
-- **Bidirectional gripper control**: position, torque, motion profile, and state
-  readback.
-- **Service/action server node**: a single ROS 2 node owns the TCP bridge and
-  exposes stable APIs for robot task nodes.
-- **Safe grasp action**: performs one closing motion and judges grasp success
-  using current feedback.
-- **Live web dashboard**: monitor position, current, velocity, temperature, and
-  torque state in a browser.
-- **Controller recovery helpers**: retries DRL start, gripper initialize, and
-  TCP reconnect paths for common controller/serial startup issues.
-- **Legacy archive**: original standalone scripts are kept in `old/` for
-  reference.
+---
 
-## Architecture
+## Why This Project Exists
+
+On the target Doosan E0509 setup, directly reading gripper feedback from ROS 2
+through DRL was not reliable enough for closed-loop control.
+
+This bridge solves the problem by:
+
+- running a TCP server inside a DRL script on the Doosan controller,
+- using DRL to communicate with the gripper over flange RS-485 Modbus RTU,
+- sending lightweight binary command/response packets between ROS 2 and DRL,
+- publishing gripper state back to ROS 2 for robot task coordination.
+
+---
+
+## Key Features
+
+- **Bidirectional gripper control**
+  - Position move
+  - Torque ON/OFF
+  - Motion profile configuration
+  - State readback
+
+- **ROS 2 service/action server**
+  - A single node owns the TCP bridge
+  - Robot task nodes can control the gripper through stable service/action APIs
+
+- **Safe grasp action**
+  - Performs one closing motion
+  - Detects grasp success using current feedback
+  - Provides action feedback and result for robot task logic
+
+- **Live web dashboard**
+  - Browser-based monitoring and manual control
+  - Position, current, velocity, temperature, torque state, and moving state
+
+- **Controller recovery helpers**
+  - DRL start retry
+  - TCP reconnect
+  - Gripper initialize retry
+  - Flange serial recovery logic
+
+---
+
+## System Architecture
 
 ```text
                   ROS 2 robot task/action node
@@ -64,9 +90,11 @@ The web dashboard can also own the bridge directly:
 Browser <-- SocketIO --> web_dashboard_node --> TCP bridge --> DRL --> Gripper
 ```
 
-Do not run `gripper_service_node` and `web_dashboard_node` at the same time
-unless the dashboard has been changed to use the service node as a client. Only
-one node should own the TCP bridge.
+> Do not run `gripper_service_node` and `web_dashboard_node` at the same time
+> unless the dashboard has been changed to use the service node as a client.
+> Only one process should own the TCP bridge.
+
+---
 
 ## Repository Layout
 
@@ -102,15 +130,21 @@ one node should own the TCP bridge.
     └── legacy standalone prototype files
 ```
 
+---
+
 ## Requirements
 
-- ROS 2 Humble or compatible ROS 2 distribution
+- Ubuntu 22.04
+- ROS 2 Humble
 - Doosan ROS 2 packages, including `dsr_msgs2`
+- Python 3.10+
 - Python packages:
 
 ```bash
 pip install flask flask-socketio
 ```
+
+---
 
 ## Build
 
@@ -122,11 +156,13 @@ colcon build --packages-select dsr_gripper_tcp_interfaces dsr_gripper_tcp
 source install/setup.bash
 ```
 
+---
+
 ## Quick Start
 
-### 1. Service/action server for robot integration
+### 1. Start the Service/Action Server
 
-Use this when another robot control node should command the gripper.
+Use this node when another robot control node should command the gripper.
 
 ```bash
 ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
@@ -147,7 +183,7 @@ Main interfaces:
 - `/gripper_service/set_torque`
 - `/gripper_service/safe_grasp`
 
-Torque on:
+Torque ON:
 
 ```bash
 ros2 service call /gripper_service/set_torque \
@@ -161,7 +197,7 @@ ros2 service call /gripper_service/set_position \
   dsr_gripper_tcp_interfaces/srv/SetPosition "{position: 0, timeout_sec: 5.0}"
 ```
 
-Move to position:
+Move to a target position:
 
 ```bash
 ros2 service call /gripper_service/set_position \
@@ -183,9 +219,9 @@ Monitor state:
 ros2 topic echo /gripper_service/state
 ```
 
-### 2. Web dashboard node
+### 2. Start the Web Dashboard
 
-Use this when you want browser-based manual control and telemetry.
+Use this node for browser-based monitoring and manual control.
 
 ```bash
 ros2 launch dsr_gripper_tcp web_dashboard_node.launch.py \
@@ -201,9 +237,7 @@ Open:
 http://localhost:5000
 ```
 
-### 3. CLI example
-
-Simple close/open example:
+### 3. Run the CLI Example
 
 ```bash
 ros2 run dsr_gripper_tcp example_gripper_tcp \
@@ -212,23 +246,30 @@ ros2 run dsr_gripper_tcp example_gripper_tcp \
   --service-prefix ""
 ```
 
+---
+
 ## Safe Grasp Behavior
 
-`SafeGrasp.action` performs a single closing motion to `target_position`. It does
-not step the gripper incrementally. After the motion completes, grasp success is
-judged using current feedback:
+`SafeGrasp.action` performs a single closing motion to `target_position`.
+It does not move the gripper step-by-step.
+
+After the motion completes, grasp success is judged using current feedback:
 
 - success if `abs(final_current) >= max_current`
 - success if the current increase from the start is greater than or equal to
   `current_delta_threshold`
 
-The DRL-side move logic also treats a high current condition as a valid grasp
+The DRL-side move logic also treats a high-current condition as a valid grasp
 completion signal, so the gripper can stop before reaching the final close
 position when it contacts an object.
 
-## Service Node State Feedback
+---
 
-`/gripper_service/state` publishes `dsr_gripper_tcp_interfaces/msg/GripperState`.
+## State Feedback
+
+`/gripper_service/state` publishes
+`dsr_gripper_tcp_interfaces/msg/GripperState`.
+
 Important fields:
 
 - `present_position`: current gripper position pulse
@@ -241,7 +282,9 @@ Important fields:
 - `status_text`: node-side status string
 
 A robot task action server can subscribe to this topic while executing arm
-motions and abort/recover if `object_lost` becomes true.
+motions and abort or recover if `object_lost` becomes true.
+
+---
 
 ## Legacy Files
 
@@ -255,13 +298,15 @@ The original standalone prototype files are kept under `old/`:
 
 They are kept for reference only. New development should use the ROS 2 packages.
 
-## More Documentation
+---
 
-See package-level documentation:
+## More Documentation
 
 - `dsr_gripper_tcp/README.md`
 - `dsr_gripper_tcp_interfaces/msg/GripperState.msg`
 - `dsr_gripper_tcp_interfaces/action/SafeGrasp.action`
+
+---
 
 ## Status
 
