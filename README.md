@@ -61,6 +61,7 @@ This bridge solves the problem by:
   - TCP reconnect
   - Gripper initialize retry
   - Flange serial recovery logic
+  - Recoverable command retry for read/config/torque paths
 
 ---
 
@@ -93,6 +94,10 @@ Browser <-- SocketIO --> web_dashboard_node --> TCP bridge --> DRL --> Gripper
 > Do not run `gripper_service_node` and `web_dashboard_node` at the same time
 > unless the dashboard has been changed to use the service node as a client.
 > Only one process should own the TCP bridge.
+>
+> Recommended operational mode: run `gripper_service_node` as the single bridge
+> owner. `web_dashboard_node` direct-owner mode is retained as a legacy
+> compatibility path.
 
 ---
 
@@ -162,7 +167,8 @@ source install/setup.bash
 
 ### 1. Start the Service/Action Server
 
-Use this node when another robot control node should command the gripper.
+Use this node when another robot control node should command the gripper. This
+is the recommended operational entrypoint.
 
 ```bash
 ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
@@ -182,6 +188,16 @@ Main interfaces:
 - `/gripper_service/get_motion_profile`
 - `/gripper_service/set_torque`
 - `/gripper_service/safe_grasp`
+
+Behavior notes:
+
+- `/gripper_service/get_motion_profile` returns the node's cached motion
+  profile. It is not a controller readback service in the current version.
+- `/gripper_service/safe_grasp` sends a non-blocking move command, then polls
+  live state to publish feedback until grasp success, timeout, cancel, or
+  target reach without grasp.
+- On communication errors, the service node preserves the last known good state
+  and updates `status_text` with the latest error context.
 
 Torque ON:
 

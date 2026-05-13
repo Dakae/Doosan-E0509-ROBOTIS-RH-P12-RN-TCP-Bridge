@@ -13,12 +13,16 @@ Same Flask/SocketIO frontend as :mod:`web_dashboard`, but wrapped in a proper
 
 The Flask/SocketIO web UI keeps working exactly the same way as the original
 threaded dashboard - only the lifecycle moves under ROS2.
+
+This node still directly owns the TCP bridge for backward compatibility. That
+direct-owner mode is now considered legacy; the long-term direction is to move
+the dashboard to a client of ``gripper_service_node`` instead of owning the
+bridge itself.
 """
 
 from __future__ import annotations
 
 import threading
-import socket as pysocket
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
@@ -32,7 +36,7 @@ from flask import Flask, render_template_string
 from flask_socketio import SocketIO
 
 from dsr_gripper_tcp.gripper_tcp_bridge import BridgeConfig, DoosanGripperTcpBridge
-from dsr_gripper_tcp.example_gripper_tcp import set_robot_mode_autonomous
+from dsr_gripper_tcp.robot_utils import set_robot_mode_autonomous
 from dsr_gripper_tcp.web_dashboard import (
     HTML_TEMPLATE,
     POSITION_MAX,
@@ -76,6 +80,8 @@ class GripperWebDashboardNode(Node):
         self.declare_parameter('init_attempts', 5)
         self.declare_parameter('init_timeout_sec', 30.0)
         self.declare_parameter('init_retry_delay_sec', 1.0)
+        self.declare_parameter('state_poll_timeout_sec', 2.0)
+        self.declare_parameter('command_retry_count', 1)
 
         gp = self.get_parameter
         self.web_host: str = gp('web_host').get_parameter_value().string_value
@@ -86,6 +92,10 @@ class GripperWebDashboardNode(Node):
         self.service_prefix: str = gp('service_prefix').get_parameter_value().string_value
         self._joint_name: str = gp('joint_name').get_parameter_value().string_value
         self._move_timeout: float = gp('move_timeout_sec').get_parameter_value().double_value
+        self._state_poll_timeout: float = max(
+            gp('state_poll_timeout_sec').get_parameter_value().double_value,
+            0.1,
+        )
 
         cfg = BridgeConfig(
             controller_host=gp('controller_host').get_parameter_value().string_value,
@@ -102,6 +112,7 @@ class GripperWebDashboardNode(Node):
             drl_stop_settle_sec=gp('drl_stop_settle_sec').get_parameter_value().double_value,
             drl_start_retry_count=gp('drl_start_retry_count').get_parameter_value().integer_value,
             drl_start_retry_delay_sec=gp('drl_start_retry_delay_sec').get_parameter_value().double_value,
+            command_retry_count=gp('command_retry_count').get_parameter_value().integer_value,
         )
 
         # ---------- Bridge ----------
@@ -200,20 +211,13 @@ class GripperWebDashboardNode(Node):
         if not self.tcp_lock.acquire(timeout=0.005):
             return
         try:
-            try:
-                state = self.bridge.read_state()
-            except (BrokenPipeError, ConnectionError, OSError, pysocket.error) as exc:
-                self.get_logger().warning(
-                    f"Bridge socket error: {exc}", throttle_duration_sec=2.0
-                )
-                self._reset_socket()
-                self.socketio.emit('state_update', {'status': 'error'})
-                return
-            except Exception as exc:  # noqa: BLE001
-                self.get_logger().warning(
-                    f"Bridge read failed: {exc}", throttle_duration_sec=2.0
-                )
-                return
+            state = self.bridge.read_state(timeout_sec=self._state_poll_timeout)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(
+                f"Bridge read failed: {exc}", throttle_duration_sec=2.0
+            )
+            self.socketio.emit('state_update', {'status': 'error'})
+            return
         finally:
             self.tcp_lock.release()
 
@@ -325,7 +329,6 @@ class GripperWebDashboardNode(Node):
                     fn()
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().warning(f"Bridge call failed: {exc}")
-                self._reset_socket()
         threading.Thread(target=runner, daemon=True).start()
 
     def _do_estop(self) -> None:
@@ -333,21 +336,11 @@ class GripperWebDashboardNode(Node):
         def runner():
             try:
                 with self.tcp_lock:
-                    state = self.bridge.read_state()
+                    state = self.bridge.read_state(timeout_sec=self._state_poll_timeout)
                     self.bridge.move_to(int(state.present_position), 1.0)
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().warning(f"E-stop failed: {exc}")
-                self._reset_socket()
         threading.Thread(target=runner, daemon=True).start()
-
-    def _reset_socket(self) -> None:
-        try:
-            sock = getattr(self.bridge, '_socket', None)
-            if sock is not None:
-                sock.close()
-        except Exception:
-            pass
-        self.bridge._socket = None  # noqa: SLF001
 
 
 def main(args=None) -> None:

@@ -65,7 +65,7 @@ ros2 run dsr_gripper_tcp web_dashboard
 > 코드에 하드코딩되어 있습니다. 환경에 맞게 수정해서 사용하거나,
 > 아래의 ROS2 노드 버전을 권장합니다.
 
-### 3. 웹 대시보드 - ROS2 노드 버전 (권장)
+### 3. 웹 대시보드 - ROS2 노드 버전
 
 ```bash
 ros2 launch dsr_gripper_tcp web_dashboard_node.launch.py \
@@ -89,6 +89,11 @@ ros2 run dsr_gripper_tcp web_dashboard_node \
 
 기본 노드 이름: `gripper_web_dashboard`
 
+> 참고: 이 노드는 하위 호환성을 위해 아직 bridge를 직접 소유합니다.
+> 운영 표준은 `gripper_service_node`를 단일 bridge owner로 사용하는
+> 구조이며, 이 대시보드 노드는 장기적으로 해당 service/action/topic의
+> client 구조로 옮겨갈 예정입니다.
+
 ### 파라미터
 
 | 이름 | 타입 | 기본값 | 설명 |
@@ -107,6 +112,8 @@ ros2 run dsr_gripper_tcp web_dashboard_node \
 | `poll_rate_hz` | double | `20.0` | TCP 상태 폴링 주기 |
 | `joint_name` | string | `rh_p12_rn` | JointState `name[0]` |
 | `move_timeout_sec` | double | `5.0` | move_to 타임아웃 |
+| `state_poll_timeout_sec` | double | `2.0` | read_state 상위 타임아웃 |
+| `command_retry_count` | int | `1` | recoverable command 재시도 횟수 |
 | `connect_timeout_sec` | double | `20.0` | DRL TCP 서버 접속 재시도 타임아웃 |
 | `post_drl_start_sleep_sec` | double | `0.5` | DrlStart 직후 TCP 접속 시도 전 대기 |
 | `stop_existing_drl` | bool | `true` | 시작 시 기존 DRL이 실행 중이면 정지 후 재시작 |
@@ -177,6 +184,15 @@ ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
 - Service: `/gripper_service/set_torque`
 - Service: `/gripper_service/get_state`
 - Action: `/gripper_service/safe_grasp`
+
+추가 동작 의미:
+
+- `/gripper_service/get_motion_profile`은 controller readback이 아니라 node
+  cached profile을 반환합니다.
+- `/gripper_service/safe_grasp`는 polling 기반 액션으로, 진행 중
+  feedback를 publish하며 cancel 시 현재 위치 hold를 시도합니다.
+- `state` topic은 통신 장애 시 마지막 정상 상태를 보존하면서
+  `status_text`에 최신 오류를 반영합니다.
 
 #### Topic: `/gripper_service/state`
 

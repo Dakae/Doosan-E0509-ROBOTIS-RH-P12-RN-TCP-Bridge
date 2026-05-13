@@ -3,6 +3,10 @@
 This is the original threaded dashboard: it spins up a ROS2 node in a background
 thread purely to use the gripper TCP bridge, then serves a SocketIO web UI on
 port 5000. For the proper ROS2 node version see :mod:`web_dashboard_node`.
+
+This direct-owner mode is kept as a legacy compatibility path. The recommended
+operational entrypoint is ``gripper_service_node`` as the single TCP bridge
+owner, with future dashboard work moving toward a ROS client architecture.
 """
 
 import threading
@@ -13,7 +17,7 @@ from flask_socketio import SocketIO
 import rclpy
 
 from dsr_gripper_tcp.gripper_tcp_bridge import DoosanGripperTcpBridge, BridgeConfig
-from dsr_gripper_tcp.example_gripper_tcp import set_robot_mode_autonomous
+from dsr_gripper_tcp.robot_utils import set_robot_mode_autonomous
 
 app = Flask(__name__)
 socketio = SocketIO(app, async_mode='threading', cors_allowed_origins="*")
