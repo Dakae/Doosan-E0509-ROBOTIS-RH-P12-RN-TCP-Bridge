@@ -56,6 +56,7 @@ Flange RS-485 Modbus RTU로 그리퍼와 통신합니다. ROS 2 쪽에서는 이
   - 로봇 작업 로직에서 사용할 수 있는 action feedback/result 제공
 
 - **실시간 웹 대시보드**
+  - `gripper_service_node`의 topic/service를 사용하는 ROS 2 client 구조
   - 브라우저 기반 모니터링 및 수동 제어
   - 위치, 전류, 속도, 온도, 토크, 이동 상태 확인
 
@@ -64,6 +65,7 @@ Flange RS-485 Modbus RTU로 그리퍼와 통신합니다. ROS 2 쪽에서는 이
   - TCP 재연결
   - 그리퍼 initialize 재시도
   - Flange serial 복구 로직
+  - read/config/torque 경로의 복구 가능한 명령 재시도
 
 ---
 
@@ -87,15 +89,23 @@ Flange RS-485 Modbus RTU로 그리퍼와 통신합니다. ROS 2 쪽에서는 이
                     [ ROBOTIS RH-P12-RN(A) ]
 ```
 
-웹 대시보드는 bridge를 직접 소유하는 방식으로 실행할 수도 있습니다.
+웹 대시보드는 TCP bridge를 직접 소유하지 않고, `gripper_service_node`의
+ROS 2 topic/service를 사용하는 client로 실행됩니다.
 
 ```text
-Browser <-- SocketIO --> web_dashboard_node --> TCP bridge --> DRL --> Gripper
+Browser <-- SocketIO --> web_dashboard_node
+                              |
+                              | service / topic
+                              v
+                    [ gripper_service_node ]
+                              |
+                         TCP bridge
+                              |
+                         DRL --> Gripper
 ```
 
-> `gripper_service_node`와 `web_dashboard_node`는 동시에 실행하지 않는 것을
-> 권장합니다. 둘 다 TCP bridge를 직접 소유하기 때문입니다. 동시에 사용하려면
-> 웹 대시보드를 service node의 client 구조로 변경해야 합니다.
+> `gripper_service_node`만 TCP bridge를 소유합니다. `web_dashboard_node`는
+> dashboard client이므로 함께 실행할 수 있습니다.
 
 ---
 
@@ -174,6 +184,12 @@ ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
   service_prefix:=
 ```
 
+> **시작 시 `INITIALIZE`가 몇 차례 실패하거나 오래 걸릴 수 있습니다.**
+> TCP 연결은 성공했더라도 Doosan flange RS-485/Modbus 쪽 그리퍼 응답이
+> 늦으면 `INITIALIZE attempt N/M failed`가 먼저 보일 수 있습니다.
+> 기본 설정은 최대 10회 재시도하며, 최종적으로 `Gripper service node ready`
+> 로그가 나오면 정상 준비된 상태입니다.
+
 주요 인터페이스:
 
 - `/gripper_service/state`
@@ -185,6 +201,16 @@ ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
 - `/gripper_service/get_motion_profile`
 - `/gripper_service/set_torque`
 - `/gripper_service/safe_grasp`
+
+동작 메모:
+
+- `/gripper_service/get_motion_profile`은 현재 버전에서 컨트롤러 readback이
+  아니라 노드가 캐시한 motion profile 값을 반환합니다.
+- `/gripper_service/safe_grasp`는 non-blocking move 명령을 보낸 뒤 live
+  state를 polling하면서 파지 성공, timeout, cancel, 파지 없이 목표 도달 중
+  하나가 될 때까지 feedback을 publish합니다.
+- 통신 오류가 발생하면 service node는 마지막 정상 상태를 보존하고
+  `status_text`에 최신 오류 문맥을 반영합니다.
 
 토크 ON:
 
@@ -207,6 +233,9 @@ ros2 service call /gripper_service/set_position \
   dsr_gripper_tcp_interfaces/srv/SetPosition "{position: 700, timeout_sec: 5.0}"
 ```
 
+`timeout_sec`는 목표 위치 도달을 기다리는 시간입니다. `0` 이하이면
+`gripper_service_node`의 `default_move_timeout_sec` 값을 사용합니다.
+
 안전 파지:
 
 ```bash
@@ -215,6 +244,11 @@ ros2 action send_goal /gripper_service/safe_grasp \
   "{target_position: 700, max_current: 400, current_delta_threshold: 120, timeout_sec: 8.0}" \
   --feedback
 ```
+
+`max_current`는 현재 전류 절댓값 기준입니다. 이 값 이상이면 파지 성공으로
+판단합니다. `current_delta_threshold`는 시작 전류 대비 증가량 기준입니다.
+예를 들어 시작 전류가 50이고 현재 전류가 180이면 `current_delta`는 130입니다.
+`timeout_sec`가 `0` 이하이면 `default_safe_grasp_timeout_sec` 값을 사용합니다.
 
 상태 모니터링:
 
@@ -228,9 +262,7 @@ ros2 topic echo /gripper_service/state
 
 ```bash
 ros2 launch dsr_gripper_tcp web_dashboard_node.launch.py \
-  controller_host:=110.120.1.56 \
-  namespace:=dsr01 \
-  service_prefix:= \
+  gripper_service_ns:=/gripper_service \
   web_port:=5000
 ```
 
@@ -250,6 +282,57 @@ ros2 run dsr_gripper_tcp example_gripper_tcp \
   --namespace dsr01 \
   --service-prefix ""
 ```
+
+---
+
+## 주요 파라미터
+
+### `gripper_service_node`
+
+| 이름 | 기본값 | 설명 |
+|---|---:|---|
+| `controller_host` | `110.120.1.56` | Doosan 컨트롤러 IP 주소 |
+| `tcp_port` | `20002` | DRL TCP 서버 포트 |
+| `namespace` | `dsr01` | Doosan ROS 2 네임스페이스 |
+| `service_prefix` | `""` | Doosan DRL 서비스 prefix. 환경에 따라 `dsr_controller2` 등을 사용 |
+| `skip_set_autonomous` | `false` | 시작 시 robot mode를 autonomous로 바꾸는 절차를 건너뜀 |
+| `initialize_on_start` | `true` | **시작 시 그리퍼 `INITIALIZE` 명령 수행. RS-485 응답이 늦으면 여러 번 실패 후 성공할 수 있음** |
+| `goal_current` | `400` | 기본 목표 전류. 파지 힘/current limit 기준 |
+| `profile_velocity` | `1500` | 기본 이동 속도 |
+| `profile_acceleration` | `1000` | 기본 이동 가속도 |
+| `poll_rate_hz` | `20.0` | `/gripper_service/state` publish 주기 |
+| `position_max` | `1150` | 그리퍼 최대 위치 pulse. JointState 정규화에도 사용 |
+| `default_move_timeout_sec` | `5.0` | `set_position` 요청에서 timeout이 0 이하일 때 사용하는 기본값 |
+| `default_safe_grasp_timeout_sec` | `10.0` | `safe_grasp` goal timeout이 0 이하일 때 사용하는 기본값 |
+| `safe_grasp_feedback_rate_hz` | `10.0` | `safe_grasp` feedback publish 주기 |
+| `grasp_current_threshold` | `300` | 상태 topic의 `grasp_detected` 판단용 절대 전류 기준 |
+| `object_lost_current_threshold` | `80` | 파지 후 전류가 이 값 이하로 떨어지면 놓침 판단 후보 |
+| `object_lost_position_delta` | `80` | 파지 위치 대비 이 값 이상 위치가 변하면 `object_lost` 판단 |
+| `state_poll_timeout_sec` | `2.0` | 상태 읽기 TCP 응답 대기 시간 |
+| `command_retry_count` | `1` | TCP transport 오류 시 read/config/torque/initialize 명령 재시도 횟수 |
+| `connect_timeout_sec` | `20.0` | DRL TCP 서버 접속 대기 시간 |
+| `post_drl_start_sleep_sec` | `0.5` | DRL start 요청 직후 TCP 접속 전 대기 시간 |
+| `stop_existing_drl` | `true` | 시작 시 기존 DRL을 정지 후 새 DRL 시작 |
+| `drl_stop_mode` | `1` | 기존 DRL 정지 모드. `0=QUICK_STO`, `1=QUICK`, `2=SLOW`, `3=HOLD` |
+| `drl_stop_settle_sec` | `5.0` | DRL stop 후 IDLE 전환 대기 시간 |
+| `drl_start_retry_count` | `3` | DRL start 실패 시 재시도 횟수 |
+| `drl_start_retry_delay_sec` | `1.0` | DRL start 재시도 사이 대기 시간 |
+| `init_attempts` | `10` | **시작 시 `INITIALIZE` 전체 재시도 횟수** |
+| `init_timeout_sec` | `30.0` | **`INITIALIZE` TCP 응답 대기 시간** |
+| `init_retry_delay_sec` | `2.0` | **`INITIALIZE` 재시도 사이 대기 시간** |
+
+### `web_dashboard_node`
+
+| 이름 | 기본값 | 설명 |
+|---|---:|---|
+| `gripper_service_ns` | `/gripper_service` | 연결할 `gripper_service_node` 네임스페이스 |
+| `web_host` | `0.0.0.0` | Flask/SocketIO 바인딩 주소 |
+| `web_port` | `5000` | 웹 대시보드 포트 |
+| `joint_name` | `rh_p12_rn` | 웹 노드가 legacy `~/joint_state`를 publish할 때 사용할 joint 이름 |
+| `position_max` | `1150` | UI 위치 bar와 JointState 정규화 기준 |
+| `move_timeout_sec` | `5.0` | 웹 UI 이동 명령이 `set_position`에 전달하는 timeout |
+| `command_timeout_sec` | `5.0` | 웹 노드가 service 응답을 기다리는 상위 timeout |
+| `service_wait_timeout_sec` | `2.0` | service discovery 재시도 간격 |
 
 ---
 
@@ -309,10 +392,3 @@ DRL 내부 move 로직도 전류가 충분히 높아지면 물체를 잡은 것�
 - `dsr_gripper_tcp/README.md`
 - `dsr_gripper_tcp_interfaces/msg/GripperState.msg`
 - `dsr_gripper_tcp_interfaces/action/SafeGrasp.action`
-
----
-
-## 상태
-
-이 프로젝트는 Doosan E0509 + ROBOTIS RH-P12-RN(A) 환경에서 개발 및 테스트
-중입니다.

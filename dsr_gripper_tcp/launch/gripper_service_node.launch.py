@@ -35,9 +35,9 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('drl_stop_settle_sec', default_value='5.0'),
         DeclareLaunchArgument('drl_start_retry_count', default_value='3'),
         DeclareLaunchArgument('drl_start_retry_delay_sec', default_value='1.0'),
-        DeclareLaunchArgument('init_attempts', default_value='5'),
+        DeclareLaunchArgument('init_attempts', default_value='10'),
         DeclareLaunchArgument('init_timeout_sec', default_value='30.0'),
-        DeclareLaunchArgument('init_retry_delay_sec', default_value='1.0'),
+        DeclareLaunchArgument('init_retry_delay_sec', default_value='2.0'),
     ]
 
     service_node = Node(

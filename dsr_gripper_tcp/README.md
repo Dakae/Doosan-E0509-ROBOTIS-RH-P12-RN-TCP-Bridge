@@ -67,11 +67,12 @@ ros2 run dsr_gripper_tcp web_dashboard
 
 ### 3. 웹 대시보드 - ROS2 노드 버전
 
+먼저 `gripper_service_node`를 실행해야 합니다. 이 웹 노드는 TCP bridge를
+직접 소유하지 않고 `/gripper_service`의 topic/service를 사용하는 client입니다.
+
 ```bash
 ros2 launch dsr_gripper_tcp web_dashboard_node.launch.py \
-  controller_host:=192.168.137.100 \
-  namespace:=dsr01 \
-  service_prefix:=dsr_controller2 \
+  gripper_service_ns:=/gripper_service \
   web_port:=5000
 ```
 
@@ -80,50 +81,29 @@ ros2 launch dsr_gripper_tcp web_dashboard_node.launch.py \
 ```bash
 ros2 run dsr_gripper_tcp web_dashboard_node \
   --ros-args \
-  -p controller_host:=192.168.137.100 \
-  -p namespace:=dsr01 \
-  -p service_prefix:=dsr_controller2
+  -p gripper_service_ns:=/gripper_service
 ```
 
 ## ROS2 노드 인터페이스 (`web_dashboard_node`)
 
 기본 노드 이름: `gripper_web_dashboard`
 
-> 참고: 이 노드는 하위 호환성을 위해 아직 bridge를 직접 소유합니다.
-> 운영 표준은 `gripper_service_node`를 단일 bridge owner로 사용하는
-> 구조이며, 이 대시보드 노드는 장기적으로 해당 service/action/topic의
-> client 구조로 옮겨갈 예정입니다.
+> 이 노드는 `DoosanGripperTcpBridge`를 만들지 않습니다.
+> `gripper_service_node`만 bridge를 단일 소유하고, 웹 노드는 해당
+> service/topic을 호출하고 구독합니다.
 
 ### 파라미터
 
 | 이름 | 타입 | 기본값 | 설명 |
 |---|---|---|---|
-| `controller_host` | string | `110.120.1.56` | 컨트롤러 IP |
-| `tcp_port` | int | `20002` | DRL TCP 서버 포트 |
-| `namespace` | string | `dsr01` | 로봇 네임스페이스 |
-| `service_prefix` | string | `""` | DRL 서비스 prefix (예: `dsr_controller2`) |
-| `skip_set_autonomous` | bool | `false` | autonomous 모드 설정 스킵 |
-| `initialize_on_start` | bool | `true` | 시작 시 그리퍼 INITIALIZE 호출 |
-| `goal_current` | int | `400` | 초기 grip 전류(mA) |
-| `profile_velocity` | int | `1500` | 모션 프로파일 속도 |
-| `profile_acceleration` | int | `1000` | 모션 프로파일 가속도 |
+| `gripper_service_ns` | string | `/gripper_service` | 연결할 gripper service 노드 네임스페이스 |
 | `web_host` | string | `0.0.0.0` | Flask 바인딩 호스트 |
 | `web_port` | int | `5000` | Flask 포트 |
-| `poll_rate_hz` | double | `20.0` | TCP 상태 폴링 주기 |
 | `joint_name` | string | `rh_p12_rn` | JointState `name[0]` |
-| `move_timeout_sec` | double | `5.0` | move_to 타임아웃 |
-| `state_poll_timeout_sec` | double | `2.0` | read_state 상위 타임아웃 |
-| `command_retry_count` | int | `1` | recoverable command 재시도 횟수 |
-| `connect_timeout_sec` | double | `20.0` | DRL TCP 서버 접속 재시도 타임아웃 |
-| `post_drl_start_sleep_sec` | double | `0.5` | DrlStart 직후 TCP 접속 시도 전 대기 |
-| `stop_existing_drl` | bool | `true` | 시작 시 기존 DRL이 실행 중이면 정지 후 재시작 |
-| `drl_stop_mode` | int | `1` | DrlStop 모드 (0=QUICK_STO, 1=QUICK, 2=SLOW, 3=HOLD) |
-| `drl_stop_settle_sec` | double | `5.0` | DrlStop 후 IDLE 전이까지 폴링 타임아웃 |
-| `drl_start_retry_count` | int | `3` | DrlStart 실패 시 재시도 횟수 |
-| `drl_start_retry_delay_sec` | double | `1.0` | DrlStart 재시도 사이 대기 |
-| `init_attempts` | int | `5` | 부팅 시 INITIALIZE 명령 재시도 횟수 |
-| `init_timeout_sec` | double | `30.0` | INITIALIZE 응답 대기 타임아웃 |
-| `init_retry_delay_sec` | double | `1.0` | INITIALIZE 재시도 사이 대기 |
+| `position_max` | int | `1150` | UI/JointState 정규화에 사용할 최대 위치 |
+| `move_timeout_sec` | double | `5.0` | `set_position` 서비스 요청 타임아웃 값 |
+| `command_timeout_sec` | double | `5.0` | 서비스 응답 대기 상위 타임아웃 |
+| `service_wait_timeout_sec` | double | `2.0` | 서비스 discovery 재시도 간격 |
 
 ### Topics
 
@@ -137,11 +117,19 @@ ros2 run dsr_gripper_tcp web_dashboard_node \
 
 **Subscribers**
 
+- `/gripper_service/state` (`dsr_gripper_tcp_interfaces/msg/GripperState`) -
+  웹 UI와 legacy topic publish에 사용하는 원본 상태.
 - `~/goal_position` (`std_msgs/Int32`) - 목표 위치 (0..1150 pulse)
 - `~/torque_enable` (`std_msgs/Bool`) - 토크 ON/OFF
 - `~/motion_profile` (`std_msgs/Float32MultiArray`) -
   `[goal_current, profile_velocity, profile_acceleration]`
 - `~/emergency_stop` (`std_msgs/Bool`) - `true`면 현재 위치 유지
+
+**Service Clients**
+
+- `/gripper_service/set_position`
+- `/gripper_service/set_torque`
+- `/gripper_service/set_motion_profile`
 
 ### 사용 예 (다른 터미널에서)
 
@@ -426,8 +414,9 @@ action client를 호출하면 됩니다. `safe_grasp`는 step 이동을 하지 �
 | 항목 | `web_dashboard` (스레드) | `web_dashboard_node` (ROS2) |
 |---|---|---|
 | 설정 | 코드 하드코딩 | ROS 파라미터 |
-| 폴링 | `threading.Thread` | `rclpy.Timer` (executor) |
+| 상태 입력 | TCP 직접 폴링 | `/gripper_service/state` subscribe |
 | ROS 토픽 | 없음 | JointState, raw_state pub + cmd sub |
+| 명령 경로 | TCP bridge 직접 호출 | `/gripper_service/*` service client |
 | 다른 ROS 노드와 통합 | 불편 | `ros2 launch`로 자연스럽게 통합 |
 | 기능/UI | 동일 | 동일 |
 
@@ -471,7 +460,7 @@ DRL은 살아있고 TCP는 붙었는데 `INITIALIZE` 응답이 안 오는 상황
 
 1. **RS-485 케이블/그리퍼 전원 문제** - DRL은 modbus 응답을 못 받고 timeout 반복.
 2. **이전 세션이 그리퍼를 이상한 상태로 남김** - 호스트가 자동으로
-   소켓을 끊고 재연결한 뒤 `init_attempts`만큼 재시도합니다 (기본 5회).
+   소켓을 끊고 재연결한 뒤 `init_attempts`만큼 재시도합니다 (기본 10회).
 3. **컨트롤러가 hung** - 컨트롤러 재기동이 가장 확실.
 
 ### `INITIALIZE attempt N/M failed (gripper): Controller returned error status 3`
@@ -481,7 +470,7 @@ DRL은 살아있고 TCP는 붙었는데 `INITIALIZE` 응답이 안 오는 상황
 
 1. **DRL이 자가 회복 시도 중** - 이 패키지의 `initialize_gripper`는 modbus를
    최대 4회까지 시도하면서 중간에 한 번 flange serial port를 close→open으로
-   재초기화합니다. 호스트 측도 `init_attempts`만큼 (기본 5회) 재시도하므로
+   재초기화합니다. 호스트 측도 `init_attempts`만큼 (기본 10회) 재시도하므로
    잠깐 기다려 보세요.
 2. **그리퍼 전원 확인** - LED, 정상 입력 전압 확인.
 3. **컨트롤러 펜던트 재기동** - 가장 확실한 회복 방법. flange serial port가

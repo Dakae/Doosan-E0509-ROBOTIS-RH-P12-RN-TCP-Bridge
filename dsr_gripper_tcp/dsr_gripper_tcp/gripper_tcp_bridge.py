@@ -372,9 +372,12 @@ class DoosanGripperTcpBridge:
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if self._is_recoverable_exception(exc) and attempt < max_retries:
+                    retry_suffix = (
+                        f" ({attempt + 1}/{max_retries})" if max_retries > 1 else ""
+                    )
                     self._node.get_logger().warning(
                         f"{Command(command).name} transport failed ({exc}); resetting TCP bridge "
-                        f"and retrying ({attempt + 1}/{max_retries})..."
+                        f"and retrying{retry_suffix}..."
                     )
                     self.reset_connection()
                     self._ensure_socket()
