@@ -3,16 +3,12 @@ from __future__ import annotations
 import argparse
 
 import rclpy
-from dsr_msgs2.srv import SetRobotMode
 
 from dsr_gripper_tcp.gripper_tcp_bridge import (
     BridgeConfig,
     DoosanGripperTcpBridge,
-    build_service_root,
 )
-
-
-ROBOT_MODE_AUTONOMOUS = 1
+from dsr_gripper_tcp.robot_utils import set_robot_mode_autonomous
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -49,25 +45,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Skip setting the robot mode to autonomous before starting the bridge.",
     )
     return parser
-
-
-def set_robot_mode_autonomous(node, namespace: str, service_prefix: str) -> None:
-    service_root = build_service_root(namespace, service_prefix)
-    service_name = f"{service_root}/system/set_robot_mode"
-    client = node.create_client(SetRobotMode, service_name)
-
-    while not client.wait_for_service(timeout_sec=1.0):
-        node.get_logger().info(f"Waiting for {service_name}...")
-
-    request = SetRobotMode.Request()
-    request.robot_mode = ROBOT_MODE_AUTONOMOUS
-    future = client.call_async(request)
-    rclpy.spin_until_future_complete(node, future, timeout_sec=None)
-
-    response = future.result()
-    if response is None or not response.success:
-        raise RuntimeError(f"Failed to set robot mode to autonomous via {service_name}.")
-
 
 def main(args: list[str] | None = None) -> None:
     parser = build_argument_parser()

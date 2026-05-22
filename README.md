@@ -53,6 +53,7 @@ This bridge solves the problem by:
   - Provides action feedback and result for robot task logic
 
 - **Live web dashboard**
+  - ROS 2 client of `gripper_service_node` topics/services
   - Browser-based monitoring and manual control
   - Position, current, velocity, temperature, torque state, and moving state
 
@@ -61,6 +62,7 @@ This bridge solves the problem by:
   - TCP reconnect
   - Gripper initialize retry
   - Flange serial recovery logic
+  - Recoverable command retry for read/config/torque paths
 
 ---
 
@@ -84,15 +86,23 @@ This bridge solves the problem by:
                     [ ROBOTIS RH-P12-RN(A) ]
 ```
 
-The web dashboard can also own the bridge directly:
+The web dashboard does not own the TCP bridge. It runs as a ROS 2 client of
+`gripper_service_node`:
 
 ```text
-Browser <-- SocketIO --> web_dashboard_node --> TCP bridge --> DRL --> Gripper
+Browser <-- SocketIO --> web_dashboard_node
+                              |
+                              | service / topic
+                              v
+                    [ gripper_service_node ]
+                              |
+                         TCP bridge
+                              |
+                         DRL --> Gripper
 ```
 
-> Do not run `gripper_service_node` and `web_dashboard_node` at the same time
-> unless the dashboard has been changed to use the service node as a client.
-> Only one process should own the TCP bridge.
+> `gripper_service_node` is the only TCP bridge owner. `web_dashboard_node` can
+> run alongside it because it only subscribes to topics and calls services.
 
 ---
 
@@ -162,7 +172,8 @@ source install/setup.bash
 
 ### 1. Start the Service/Action Server
 
-Use this node when another robot control node should command the gripper.
+Use this node when another robot control node should command the gripper. This
+is the recommended operational entrypoint.
 
 ```bash
 ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
@@ -170,6 +181,12 @@ ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
   namespace:=dsr01 \
   service_prefix:=
 ```
+
+> **Startup `INITIALIZE` can fail a few times or take a while.** TCP may already
+> be connected while the Doosan flange RS-485/Modbus gripper response is still
+> not ready, so `INITIALIZE attempt N/M failed` can appear before startup
+> succeeds. The default configuration retries up to 10 times; the node is ready
+> when `Gripper service node ready` is printed.
 
 Main interfaces:
 
@@ -182,6 +199,16 @@ Main interfaces:
 - `/gripper_service/get_motion_profile`
 - `/gripper_service/set_torque`
 - `/gripper_service/safe_grasp`
+
+Behavior notes:
+
+- `/gripper_service/get_motion_profile` returns the node's cached motion
+  profile. It is not a controller readback service in the current version.
+- `/gripper_service/safe_grasp` sends a non-blocking move command, then polls
+  live state to publish feedback until grasp success, timeout, cancel, or
+  target reach without grasp.
+- On communication errors, the service node preserves the last known good state
+  and updates `status_text` with the latest error context.
 
 Torque ON:
 
@@ -204,6 +231,9 @@ ros2 service call /gripper_service/set_position \
   dsr_gripper_tcp_interfaces/srv/SetPosition "{position: 700, timeout_sec: 5.0}"
 ```
 
+`timeout_sec` is how long the service waits for the target position. Values
+`0` or lower use the `gripper_service_node` `default_move_timeout_sec` value.
+
 Safe grasp:
 
 ```bash
@@ -212,6 +242,12 @@ ros2 action send_goal /gripper_service/safe_grasp \
   "{target_position: 700, max_current: 400, current_delta_threshold: 120, timeout_sec: 8.0}" \
   --feedback
 ```
+
+`max_current` is an absolute present-current threshold. The grasp succeeds when
+the current reaches this value. `current_delta_threshold` is relative to the
+current measured at the start of the action. For example, if the start current
+is 50 and the present current is 180, `current_delta` is 130. Values `0` or
+lower for `timeout_sec` use `default_safe_grasp_timeout_sec`.
 
 Monitor state:
 
@@ -225,9 +261,7 @@ Use this node for browser-based monitoring and manual control.
 
 ```bash
 ros2 launch dsr_gripper_tcp web_dashboard_node.launch.py \
-  controller_host:=110.120.1.56 \
-  namespace:=dsr01 \
-  service_prefix:= \
+  gripper_service_ns:=/gripper_service \
   web_port:=5000
 ```
 
@@ -245,6 +279,57 @@ ros2 run dsr_gripper_tcp example_gripper_tcp \
   --namespace dsr01 \
   --service-prefix ""
 ```
+
+---
+
+## Main Parameters
+
+### `gripper_service_node`
+
+| Name | Default | Description |
+|---|---:|---|
+| `controller_host` | `110.120.1.56` | Doosan controller IP address |
+| `tcp_port` | `20002` | DRL TCP server port |
+| `namespace` | `dsr01` | Doosan ROS 2 namespace |
+| `service_prefix` | `""` | Doosan DRL service prefix. Use values such as `dsr_controller2` if required by the environment |
+| `skip_set_autonomous` | `false` | Skip setting the robot mode to autonomous on startup |
+| `initialize_on_start` | `true` | **Send the gripper `INITIALIZE` command on startup. Slow RS-485 responses can cause several failed attempts before success** |
+| `goal_current` | `400` | Default target current. Used as the grip force/current limit basis |
+| `profile_velocity` | `1500` | Default motion velocity |
+| `profile_acceleration` | `1000` | Default motion acceleration |
+| `poll_rate_hz` | `20.0` | Publish rate for `/gripper_service/state` |
+| `position_max` | `1150` | Maximum gripper position pulse. Also used for JointState normalization |
+| `default_move_timeout_sec` | `5.0` | Default timeout used when a `set_position` request timeout is 0 or lower |
+| `default_safe_grasp_timeout_sec` | `10.0` | Default timeout used when a `safe_grasp` goal timeout is 0 or lower |
+| `safe_grasp_feedback_rate_hz` | `10.0` | Feedback publish rate for `safe_grasp` |
+| `grasp_current_threshold` | `300` | Absolute current threshold for `grasp_detected` in the state topic |
+| `object_lost_current_threshold` | `80` | After grasping, current below this value becomes an object-loss candidate |
+| `object_lost_position_delta` | `80` | Position delta from the grasp position required to mark `object_lost` |
+| `state_poll_timeout_sec` | `2.0` | TCP response timeout for state reads |
+| `command_retry_count` | `1` | Retry count for read/config/torque/initialize commands after TCP transport errors |
+| `connect_timeout_sec` | `20.0` | Timeout for connecting to the DRL TCP server |
+| `post_drl_start_sleep_sec` | `0.5` | Delay after DRL start before trying the TCP connection |
+| `stop_existing_drl` | `true` | Stop an existing DRL program before starting a new one |
+| `drl_stop_mode` | `1` | Stop mode for an existing DRL program. `0=QUICK_STO`, `1=QUICK`, `2=SLOW`, `3=HOLD` |
+| `drl_stop_settle_sec` | `5.0` | Wait time for DRL to settle into IDLE after stop |
+| `drl_start_retry_count` | `3` | Retry count for failed DRL start requests |
+| `drl_start_retry_delay_sec` | `1.0` | Delay between DRL start retries |
+| `init_attempts` | `10` | **Full retry count for startup `INITIALIZE`** |
+| `init_timeout_sec` | `30.0` | **TCP response timeout for `INITIALIZE`** |
+| `init_retry_delay_sec` | `2.0` | **Delay between `INITIALIZE` attempts** |
+
+### `web_dashboard_node`
+
+| Name | Default | Description |
+|---|---:|---|
+| `gripper_service_ns` | `/gripper_service` | Namespace of the `gripper_service_node` to use |
+| `web_host` | `0.0.0.0` | Flask/SocketIO bind address |
+| `web_port` | `5000` | Web dashboard port |
+| `joint_name` | `rh_p12_rn` | Joint name used when the web node publishes legacy `~/joint_state` |
+| `position_max` | `1150` | Normalization basis for the UI position bar and JointState |
+| `move_timeout_sec` | `5.0` | Timeout passed from web UI move commands to `set_position` |
+| `command_timeout_sec` | `5.0` | Upper timeout while waiting for service responses |
+| `service_wait_timeout_sec` | `2.0` | Service discovery retry interval |
 
 ---
 
@@ -306,9 +391,3 @@ They are kept for reference only. New development should use the ROS 2 packages.
 - `dsr_gripper_tcp_interfaces/msg/GripperState.msg`
 - `dsr_gripper_tcp_interfaces/action/SafeGrasp.action`
 
----
-
-## Status
-
-This project is actively being developed and tested on a Doosan E0509 +
-ROBOTIS RH-P12-RN(A) setup.

@@ -3,6 +3,10 @@
 This is the original threaded dashboard: it spins up a ROS2 node in a background
 thread purely to use the gripper TCP bridge, then serves a SocketIO web UI on
 port 5000. For the proper ROS2 node version see :mod:`web_dashboard_node`.
+
+This direct-owner mode is kept as a legacy compatibility path. The recommended
+operational entrypoint is ``gripper_service_node`` as the single TCP bridge
+owner, with future dashboard work moving toward a ROS client architecture.
 """
 
 import threading
@@ -13,7 +17,7 @@ from flask_socketio import SocketIO
 import rclpy
 
 from dsr_gripper_tcp.gripper_tcp_bridge import DoosanGripperTcpBridge, BridgeConfig
-from dsr_gripper_tcp.example_gripper_tcp import set_robot_mode_autonomous
+from dsr_gripper_tcp.robot_utils import set_robot_mode_autonomous
 
 app = Flask(__name__)
 socketio = SocketIO(app, async_mode='threading', cors_allowed_origins="*")
@@ -165,6 +169,13 @@ HTML_TEMPLATE = """
   .toggle-label { font-size: 13px; }
 
   .chart-card { grid-column: 1 / -1; }
+  .chart-toolbar {
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+    margin: 0 0 10px 0; color: var(--fg-dim); font-size: 12px;
+  }
+  .chart-toggle { display: inline-flex; align-items: center; gap: 6px; }
+  .chart-toggle input { accent-color: var(--accent); }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
   .chart-wrap { position: relative; height: 280px; }
 
   .grasping {
@@ -269,9 +280,9 @@ HTML_TEMPLATE = """
         <button onclick="setGoal(700)">Close (700)</button>
         <button onclick="setGoal({{ pos_max }})">Full ({{ pos_max }})</button>
       </div>
-      <div class="btn-row" style="grid-template-columns: 2fr 1fr;">
+      <div class="btn-row" style="grid-template-columns: 1fr 1fr;">
         <button class="primary" id="btn-move" onclick="moveToGoal()">Move To Goal</button>
-        <button class="danger" id="btn-estop" onclick="emergencyStop()">E-Stop</button>
+        <button class="primary" id="btn-safe-grasp" onclick="safeGrasp()">Safe Grasp</button>
       </div>
     </div>
 
@@ -281,6 +292,14 @@ HTML_TEMPLATE = """
         <span class="num"><span id="cur-num">400</span> mA</span>
       </div>
       <input type="range" id="goal-cur" min="{{ cur_min }}" max="{{ cur_max }}" value="400">
+    </div>
+
+    <div class="control-group">
+      <div class="head">
+        <label>Current Delta Threshold</label>
+        <span class="num"><span id="cur-delta-num">120</span> mA</span>
+      </div>
+      <input type="range" id="cur-delta" min="0" max="500" value="120">
     </div>
 
     <div class="control-group">
@@ -303,6 +322,24 @@ HTML_TEMPLATE = """
   <!-- ============= REAL-TIME CHART ============= -->
   <div class="card chart-card">
     <h2>Real-time Telemetry (last ~10s)</h2>
+    <div class="chart-toolbar">
+      <label class="chart-toggle">
+        <input type="checkbox" data-dataset="0" checked>
+        <span class="swatch" style="background:#3ea6ff"></span>Position
+      </label>
+      <label class="chart-toggle">
+        <input type="checkbox" data-dataset="1" checked>
+        <span class="swatch" style="background:#8b95a7"></span>Goal
+      </label>
+      <label class="chart-toggle">
+        <input type="checkbox" data-dataset="2" checked>
+        <span class="swatch" style="background:#f1c40f"></span>Current
+      </label>
+      <label class="chart-toggle">
+        <input type="checkbox" data-dataset="3" checked>
+        <span class="swatch" style="background:#2ecc71"></span>Velocity
+      </label>
+    </div>
     <div class="chart-wrap"><canvas id="chart"></canvas></div>
   </div>
 
@@ -317,6 +354,7 @@ const CUR_MIN = {{ cur_min }}, CUR_MAX = {{ cur_max }};
 // state
 let lastGoalPosition = 700;
 let lastGoalCurrent  = 400;
+let currentDeltaThreshold = 120;
 let currentProfile = { goal_current: 400, profile_velocity: 1500, profile_acceleration: 1000 };
 let torqueEnabled = false;
 
@@ -339,7 +377,7 @@ const chart = new Chart(document.getElementById('chart').getContext('2d'), {
     maintainAspectRatio: false,
     interaction: { intersect: false, mode: 'index' },
     plugins: {
-      legend: { labels: { color: '#e6edf3', font: { size: 11 } } },
+      legend: { display: false },
       tooltip: { backgroundColor: '#1e2532', borderColor: '#2a3142', borderWidth: 1 }
     },
     scales: {
@@ -349,6 +387,14 @@ const chart = new Chart(document.getElementById('chart').getContext('2d'), {
       yVel: { type: 'linear', display: false }
     }
   }
+});
+
+document.querySelectorAll('.chart-toggle input').forEach((input) => {
+  input.addEventListener('change', () => {
+    const idx = parseInt(input.dataset.dataset);
+    chart.setDatasetVisibility(idx, input.checked);
+    chart.update('none');
+  });
 });
 
 function pushPoint(time, pos, goal, cur, vel) {
@@ -379,7 +425,7 @@ socket.on('disconnect', () => {
 socket.on('state_update', (data) => {
   if (data.status === 'error') {
     document.getElementById('conn-dot').className = 'dot warn';
-    document.getElementById('conn-text').innerText = 'Reconnecting bridge...';
+    document.getElementById('conn-text').innerText = 'Waiting for gripper state...';
     return;
   }
   document.getElementById('conn-dot').className = 'dot ok';
@@ -447,9 +493,9 @@ function setChip(id, active, text) {
 
 function updateControlsEnabled() {
   const moveBtn = document.getElementById('btn-move');
-  const estop   = document.getElementById('btn-estop');
+  const safeGraspBtn = document.getElementById('btn-safe-grasp');
   moveBtn.disabled = !torqueEnabled;
-  estop.disabled   = !torqueEnabled;
+  safeGraspBtn.disabled = !torqueEnabled;
 }
 
 // ===== Controls =====
@@ -471,8 +517,16 @@ function moveToGoal() {
   socket.emit('move_cmd', { goal_position: lastGoalPosition });
 }
 
-function emergencyStop() {
-  socket.emit('estop_cmd');
+function safeGrasp() {
+  if (!torqueEnabled) return;
+  socket.emit('safe_grasp_cmd', {
+    target_position: lastGoalPosition,
+    max_current: lastGoalCurrent,
+    current_delta_threshold: currentDeltaThreshold,
+    timeout_sec: 8.0,
+    profile_velocity: currentProfile.profile_velocity,
+    profile_acceleration: currentProfile.profile_acceleration
+  });
 }
 
 // Torque toggle
@@ -509,6 +563,13 @@ function bindProfileSlider(sliderId, numId, key) {
 bindProfileSlider('goal-cur',   'cur-num', 'goal_current');
 bindProfileSlider('profile-vel','vel-num', 'profile_velocity');
 bindProfileSlider('profile-acc','acc-num', 'profile_acceleration');
+
+const curDelta = document.getElementById('cur-delta');
+const curDeltaNum = document.getElementById('cur-delta-num');
+curDelta.addEventListener('input', () => {
+  currentDeltaThreshold = parseInt(curDelta.value);
+  curDeltaNum.innerText = currentDeltaThreshold;
+});
 </script>
 </body>
 </html>
@@ -600,20 +661,22 @@ def handle_profile(data):
     _run_in_bridge(lambda: bridge.set_motion_profile(gc, pv, pa))
 
 
-@socketio.on('estop_cmd')
-def handle_estop():
-    """Emergency stop: command the gripper to hold its current position."""
+@socketio.on('safe_grasp_cmd')
+def handle_safe_grasp(data):
+    """Legacy direct-owner safe grasp approximation for the standalone dashboard."""
     if not bridge:
         return
-
-    def _do_stop():
-        try:
-            with tcp_lock:
-                state = bridge.read_state()
-                bridge.move_to(int(state.present_position), 1.0)
-        except Exception:
-            reset_socket_on_error()
-    threading.Thread(target=_do_stop, daemon=True).start()
+    target_position = int(data.get('target_position', 700))
+    max_current = int(data.get('max_current', 400))
+    profile_velocity = int(data.get('profile_velocity', 1500))
+    profile_acceleration = int(data.get('profile_acceleration', 1000))
+    timeout_sec = float(data.get('timeout_sec', 8.0))
+    _run_in_bridge(
+        lambda: (
+            bridge.set_motion_profile(max_current, profile_velocity, profile_acceleration),
+            bridge.move_to(target_position, timeout_sec),
+        )
+    )
 
 
 def ros_thread():

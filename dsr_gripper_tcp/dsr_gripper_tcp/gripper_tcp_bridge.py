@@ -22,9 +22,46 @@ from dsr_gripper_tcp.gripper_tcp_protocol import (
     recv_packet,
     unpack_state_payload,
 )
+from dsr_gripper_tcp.robot_utils import build_service_root
 
 
 DRL_PROGRAM_STATE_PLAY = 0
+
+
+class GripperBridgeError(RuntimeError):
+    """Base error for host-side bridge failures."""
+
+
+class RecoverableBridgeError(GripperBridgeError):
+    """Errors that can be recovered with a socket reset and reconnect."""
+
+
+class InvalidPacketError(RecoverableBridgeError):
+    """Raised when the controller sends a malformed response."""
+
+
+class UnexpectedResponseError(RecoverableBridgeError):
+    """Raised when the controller response does not match the request."""
+
+
+class ControllerStatusError(GripperBridgeError):
+    """Raised when the controller returns a valid response with an error status."""
+
+    def __init__(self, command: Command, state: GripperState) -> None:
+        self.command = command
+        self.state = state
+        super().__init__(
+            "Controller returned error status "
+            f"{int(state.status)} for command {command.name}."
+        )
+
+
+class MoveCommandUncertainError(GripperBridgeError):
+    """Raised when MOVE delivery/result is uncertain after a transport failure."""
+
+    def __init__(self, message: str, observed_state: GripperState | None = None) -> None:
+        super().__init__(message)
+        self.observed_state = observed_state
 
 
 @dataclass(slots=True)
@@ -48,6 +85,7 @@ class BridgeConfig:
     drl_stop_settle_sec: float = 5.0
     drl_start_retry_count: int = 3
     drl_start_retry_delay_sec: float = 1.0
+    command_retry_count: int = 1
 
 
 class DoosanGripperTcpBridge:
@@ -176,6 +214,9 @@ class DoosanGripperTcpBridge:
                 self._socket.close()
                 self._socket = None
 
+    def reset_connection(self) -> None:
+        self._reset_socket()
+
     def get_drl_state(self) -> int:
         req = GetDrlState.Request()
         response = self._call_service(self._get_drl_state, req, "GetDrlState")
@@ -205,6 +246,7 @@ class DoosanGripperTcpBridge:
             Command.INITIALIZE,
             pack_initialize_payload(current),
             timeout_sec=timeout_sec,
+            allow_retry=True,
         )
 
     def initialize_with_retry(
@@ -285,33 +327,73 @@ class DoosanGripperTcpBridge:
         self._config.profile_velocity = velocity
         self._config.profile_acceleration = acceleration
         payload = pack_config_payload(current, velocity, acceleration)
-        return self._request_state(Command.SET_CONFIG, payload)
+        return self._request_state(Command.SET_CONFIG, payload, allow_retry=True)
 
-    def read_state(self) -> GripperState:
-        return self._request_state(Command.READ_STATE, b"")
+    def read_state(self, timeout_sec: float | None = None) -> GripperState:
+        return self._request_state(Command.READ_STATE, b"", timeout_sec=timeout_sec, allow_retry=True)
 
     def set_torque(self, enabled: bool) -> GripperState:
-        return self._request_state(Command.SET_TORQUE, pack_torque_payload(bool(enabled)))
+        return self._request_state(
+            Command.SET_TORQUE,
+            pack_torque_payload(bool(enabled)),
+            allow_retry=True,
+        )
 
     def move_to(self, goal_position: int, timeout_sec: float = 10.0) -> GripperState:
         timeout_ms = max(0, int(timeout_sec * 1000.0))
         payload = pack_move_payload(int(goal_position), timeout_ms)
-        return self._request_state(Command.MOVE, payload, timeout_sec=max(timeout_sec + 2.0, 5.0))
+        response_timeout = 5.0 if timeout_sec <= 0 else max(timeout_sec + 2.0, 5.0)
+        return self._request_state(
+            Command.MOVE,
+            payload,
+            timeout_sec=response_timeout,
+            allow_retry=False,
+            fallback_read_state_on_failure=True,
+        )
 
     def _request_state(
         self,
         command: Command,
         payload: bytes,
         timeout_sec: float | None = None,
+        allow_retry: bool = True,
+        fallback_read_state_on_failure: bool = False,
     ) -> GripperState:
-        response = self._send_request(command, payload, timeout_sec=timeout_sec)
-        state = unpack_state_payload(response)
-        if state.status != StatusCode.OK:
-            raise RuntimeError(
-                "Controller returned error status "
-                f"{state.status} for command {Command(command).name}."
-            )
-        return state
+        max_retries = max(0, int(self._config.command_retry_count)) if allow_retry else 0
+        last_error: Exception | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._send_request(command, payload, timeout_sec=timeout_sec)
+                state = unpack_state_payload(response)
+                if state.status != StatusCode.OK:
+                    raise ControllerStatusError(Command(command), state)
+                return state
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if self._is_recoverable_exception(exc) and attempt < max_retries:
+                    retry_suffix = (
+                        f" ({attempt + 1}/{max_retries})" if max_retries > 1 else ""
+                    )
+                    self._node.get_logger().warning(
+                        f"{Command(command).name} transport failed ({exc}); resetting TCP bridge "
+                        f"and retrying{retry_suffix}..."
+                    )
+                    self.reset_connection()
+                    self._ensure_socket()
+                    continue
+                break
+
+        if fallback_read_state_on_failure and self._is_recoverable_exception(last_error):
+            observed_state = self._try_read_state_after_move_failure(timeout_sec=timeout_sec)
+            raise MoveCommandUncertainError(
+                "MOVE command transport failed; goal delivery/result is uncertain.",
+                observed_state=observed_state,
+            ) from last_error
+
+        if last_error is None:
+            raise GripperBridgeError(f"{Command(command).name} failed without an explicit error.")
+        raise last_error
 
     def _send_request(
         self,
@@ -326,21 +408,48 @@ class DoosanGripperTcpBridge:
         self._socket.settimeout(self._config.socket_timeout_sec if timeout_sec is None else timeout_sec)
         self._socket.sendall(packet)
 
-        response_command, response_sequence, response_payload = recv_packet(self._socket)
+        try:
+            response_command, response_sequence, response_payload = recv_packet(self._socket)
+        except ValueError as exc:
+            raise InvalidPacketError(str(exc)) from exc
+        except (socket.timeout, TimeoutError, OSError, ConnectionError) as exc:
+            raise RecoverableBridgeError(str(exc)) from exc
         expected_sequence = self._sequence
         self._sequence = (self._sequence + 1) % 65536
         if self._sequence == 0:
             self._sequence = 1
 
         if response_command != int(command):
-            raise RuntimeError(
+            raise UnexpectedResponseError(
                 f"Unexpected response command {response_command}, expected {int(command)}."
             )
         if response_sequence != expected_sequence:
-            raise RuntimeError(
+            raise UnexpectedResponseError(
                 f"Unexpected response sequence {response_sequence}, expected {expected_sequence}."
             )
         return response_payload
+
+    def _is_recoverable_exception(self, exc: Exception) -> bool:
+        return isinstance(
+            exc,
+            (
+                RecoverableBridgeError,
+                socket.timeout,
+                TimeoutError,
+                OSError,
+                ConnectionError,
+            ),
+        )
+
+    def _try_read_state_after_move_failure(self, timeout_sec: float | None = None) -> GripperState | None:
+        try:
+            self.reset_connection()
+            self._ensure_socket()
+            response = self._send_request(Command.READ_STATE, b"", timeout_sec=timeout_sec)
+            return unpack_state_payload(response)
+        except Exception as exc:  # noqa: BLE001
+            self._node.get_logger().warning(f"Post-MOVE state recovery failed: {exc}")
+            return None
 
     def _ensure_socket(self) -> None:
         if self._socket is None:
@@ -823,6 +932,16 @@ class DoosanGripperTcpBridge:
                     send_response(command, seq, encode_state_payload(STATUS_IO_ERROR, 0, 0, 0, 0, 0, 0))
                     return
 
+                if timeout_ms == 0:
+                    state_ok, moving, moving_status, present_current, present_temperature, present_velocity, present_position = read_state()
+                    status = STATUS_OK if state_ok else STATUS_IO_ERROR
+                    send_response(
+                        command,
+                        seq,
+                        encode_state_payload(status, moving, moving_status, present_current, present_temperature, present_velocity, present_position),
+                    )
+                    return
+
                 status, moving, moving_status, present_current, present_temperature, present_velocity, present_position = wait_until_arrived(goal_position, timeout_ms)
                 send_response(
                     command,
@@ -887,11 +1006,3 @@ class DoosanGripperTcpBridge:
             close_gripper()
             """
         ).strip()
-
-
-def build_service_root(namespace: str, service_prefix: str = "dsr_controller2") -> str:
-    normalized_namespace = namespace.strip("/")
-    normalized_prefix = service_prefix.strip("/")
-    if normalized_prefix:
-        return f"/{normalized_namespace}/{normalized_prefix}"
-    return f"/{normalized_namespace}"

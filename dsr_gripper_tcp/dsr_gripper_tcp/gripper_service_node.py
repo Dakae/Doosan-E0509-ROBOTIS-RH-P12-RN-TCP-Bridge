@@ -12,9 +12,10 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from sensor_msgs.msg import JointState
 
-from dsr_gripper_tcp.example_gripper_tcp import set_robot_mode_autonomous
 from dsr_gripper_tcp.gripper_tcp_bridge import BridgeConfig, DoosanGripperTcpBridge
 from dsr_gripper_tcp.gripper_tcp_protocol import GripperState as BridgeState
+from dsr_gripper_tcp.gripper_semantics import GripperSemanticEvaluator, SemanticStateSnapshot
+from dsr_gripper_tcp.robot_utils import set_robot_mode_autonomous
 from dsr_gripper_tcp_interfaces.action import SafeGrasp
 from dsr_gripper_tcp_interfaces.msg import GripperState
 from dsr_gripper_tcp_interfaces.srv import (
@@ -60,9 +61,12 @@ class GripperServiceNode(Node):
         self.declare_parameter('position_max', 1150)
         self.declare_parameter('default_move_timeout_sec', 5.0)
         self.declare_parameter('default_safe_grasp_timeout_sec', 10.0)
+        self.declare_parameter('safe_grasp_feedback_rate_hz', 10.0)
         self.declare_parameter('grasp_current_threshold', 300)
         self.declare_parameter('object_lost_current_threshold', 80)
         self.declare_parameter('object_lost_position_delta', 80)
+        self.declare_parameter('state_poll_timeout_sec', 2.0)
+        self.declare_parameter('command_retry_count', 1)
 
         gp = self.get_parameter
         self.robot_namespace = gp('namespace').get_parameter_value().string_value
@@ -76,6 +80,10 @@ class GripperServiceNode(Node):
         self._default_safe_grasp_timeout = gp(
             'default_safe_grasp_timeout_sec'
         ).get_parameter_value().double_value
+        self._safe_grasp_feedback_rate_hz = max(
+            gp('safe_grasp_feedback_rate_hz').get_parameter_value().double_value,
+            1.0,
+        )
         self._grasp_current_threshold = gp('grasp_current_threshold').get_parameter_value().integer_value
         self._object_lost_current_threshold = gp(
             'object_lost_current_threshold'
@@ -83,14 +91,16 @@ class GripperServiceNode(Node):
         self._object_lost_position_delta = gp(
             'object_lost_position_delta'
         ).get_parameter_value().integer_value
+        self._state_poll_timeout = max(
+            gp('state_poll_timeout_sec').get_parameter_value().double_value,
+            0.1,
+        )
 
         self._goal_current = gp('goal_current').get_parameter_value().integer_value
         self._profile_velocity = gp('profile_velocity').get_parameter_value().integer_value
         self._profile_acceleration = gp('profile_acceleration').get_parameter_value().integer_value
         self._last_goal_position = 0
         self._last_state: GripperState | None = None
-        self._had_grasp = False
-        self._last_grasp_position: int | None = None
 
         cfg = BridgeConfig(
             controller_host=gp('controller_host').get_parameter_value().string_value,
@@ -111,11 +121,17 @@ class GripperServiceNode(Node):
             drl_start_retry_delay_sec=gp(
                 'drl_start_retry_delay_sec'
             ).get_parameter_value().double_value,
+            command_retry_count=gp('command_retry_count').get_parameter_value().integer_value,
         )
 
         self._bridge_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._bridge = DoosanGripperTcpBridge(node=self, config=cfg)
+        self._semantic_evaluator = GripperSemanticEvaluator(
+            grasp_current_threshold=self._grasp_current_threshold,
+            object_lost_current_threshold=self._object_lost_current_threshold,
+            object_lost_position_delta=self._object_lost_position_delta,
+        )
         self._callback_group = ReentrantCallbackGroup()
 
         qos = QoSProfile(
@@ -206,17 +222,12 @@ class GripperServiceNode(Node):
             self.get_logger().warning(f'Bridge close failed: {exc}')
 
     def _poll_state(self) -> None:
-        if not self._bridge_lock.acquire(timeout=0.005):
-            return
         try:
-            bridge_state = self._bridge.read_state()
+            bridge_state = self._read_bridge_state()
+            state_msg = self._update_cached_state(bridge_state, 'ok')
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(f'Gripper state polling failed: {exc}', throttle_duration_sec=2.0)
-            return
-        finally:
-            self._bridge_lock.release()
-
-        state_msg = self._update_cached_state(bridge_state, 'ok')
+            state_msg = self._last_state_or_empty(str(exc))
         self._state_pub.publish(state_msg)
         self._publish_joint_state(state_msg)
 
@@ -339,6 +350,8 @@ class GripperServiceNode(Node):
         timeout_sec = float(goal.timeout_sec) if goal.timeout_sec > 0 else self._default_safe_grasp_timeout
         max_current = abs(int(goal.max_current)) if goal.max_current > 0 else self._goal_current
         delta_threshold = abs(int(goal.current_delta_threshold))
+        feedback_interval = 1.0 / self._safe_grasp_feedback_rate_hz
+        position_tolerance = 5
 
         try:
             with self._bridge_lock:
@@ -347,19 +360,16 @@ class GripperServiceNode(Node):
                     profile_velocity=self._profile_velocity,
                     profile_acceleration=self._profile_acceleration,
                 )
-                start_state = self._bridge.read_state()
+                start_state = self._bridge.read_state(timeout_sec=self._state_poll_timeout)
             self._goal_current = max_current
             baseline_current = abs(int(start_state.present_current))
             target_position = int(goal.target_position)
+            self._last_goal_position = target_position
 
-            feedback = SafeGrasp.Feedback()
-            feedback.present_position = int(start_state.present_position)
-            feedback.present_current = int(start_state.present_current)
-            feedback.current_delta = 0
-            feedback.grasp_detected = False
-            feedback.object_lost = False
-            feedback.state = self._update_cached_state(start_state, 'safe grasp starting')
-            goal_handle.publish_feedback(feedback)
+            start_msg = self._update_cached_state(start_state, 'safe grasp starting')
+            goal_handle.publish_feedback(
+                self._build_safe_grasp_feedback(start_msg, current_delta=0, grasp_detected=False)
+            )
 
             if goal_handle.is_cancel_requested:
                 state_msg = self._hold_current_position()
@@ -374,41 +384,80 @@ class GripperServiceNode(Node):
                 return result
 
             with self._bridge_lock:
-                bridge_state = self._bridge.move_to(target_position, timeout_sec=timeout_sec)
-                bridge_state = self._bridge.read_state()
+                self._bridge.move_to(target_position, timeout_sec=0.0)
 
-            self._last_goal_position = target_position
-            state_msg = self._update_cached_state(bridge_state, 'safe grasp complete')
-            current_abs = abs(int(bridge_state.present_current))
-            current_delta = abs(current_abs - baseline_current)
-            grasp_detected = current_abs >= max_current or (
-                delta_threshold > 0 and current_delta >= delta_threshold
-            )
+            deadline = time.monotonic() + timeout_sec
+            last_state_msg = start_msg
+            observed_motion = False
 
-            feedback = SafeGrasp.Feedback()
-            feedback.present_position = state_msg.present_position
-            feedback.present_current = state_msg.present_current
-            feedback.current_delta = current_delta
-            feedback.grasp_detected = grasp_detected
-            feedback.object_lost = state_msg.object_lost
-            feedback.state = state_msg
-            goal_handle.publish_feedback(feedback)
+            while time.monotonic() < deadline:
+                if goal_handle.is_cancel_requested:
+                    state_msg = self._hold_current_position()
+                    result.success = False
+                    result.message = 'safe_grasp canceled'
+                    result.final_position = state_msg.present_position
+                    result.final_current = state_msg.present_current
+                    result.grasp_detected = state_msg.grasp_detected
+                    result.object_lost = state_msg.object_lost
+                    result.state = state_msg
+                    goal_handle.canceled()
+                    return result
 
-            result.success = grasp_detected
-            result.message = 'grasp detected' if grasp_detected else 'target reached without grasp'
-            result.final_position = state_msg.present_position
-            result.final_current = state_msg.present_current
-            result.grasp_detected = grasp_detected
-            result.object_lost = state_msg.object_lost
-            result.state = state_msg
+                bridge_state = self._read_bridge_state()
+                last_state_msg = self._update_cached_state(bridge_state, 'safe grasp polling')
+                observed_motion = observed_motion or bool(last_state_msg.moving)
+                target_reached = (
+                    abs(last_state_msg.present_position - target_position) <= position_tolerance
+                    or (observed_motion and last_state_msg.in_position)
+                )
+                current_abs = abs(int(bridge_state.present_current))
+                current_delta = abs(current_abs - baseline_current)
+                grasp_detected = current_abs >= max_current or (
+                    delta_threshold > 0 and current_delta >= delta_threshold
+                )
 
-            if grasp_detected:
-                self._had_grasp = True
-                self._last_grasp_position = state_msg.present_position
-                state_msg.grasp_detected = True
-                goal_handle.succeed()
-            else:
-                goal_handle.abort()
+                goal_handle.publish_feedback(
+                    self._build_safe_grasp_feedback(
+                        last_state_msg,
+                        current_delta=current_delta,
+                        grasp_detected=grasp_detected,
+                    )
+                )
+
+                if grasp_detected:
+                    last_state_msg.grasp_detected = True
+                    result.success = True
+                    result.message = 'grasp detected'
+                    result.final_position = last_state_msg.present_position
+                    result.final_current = last_state_msg.present_current
+                    result.grasp_detected = True
+                    result.object_lost = last_state_msg.object_lost
+                    result.state = last_state_msg
+                    goal_handle.succeed()
+                    return result
+
+                if not last_state_msg.moving and target_reached:
+                    result.success = False
+                    result.message = 'target reached without grasp'
+                    result.final_position = last_state_msg.present_position
+                    result.final_current = last_state_msg.present_current
+                    result.grasp_detected = False
+                    result.object_lost = last_state_msg.object_lost
+                    result.state = last_state_msg
+                    goal_handle.abort()
+                    return result
+
+                time.sleep(feedback_interval)
+
+            timeout_state = self._last_state_or_empty('safe_grasp timeout')
+            result.success = False
+            result.message = 'safe_grasp timeout'
+            result.final_position = timeout_state.present_position
+            result.final_current = timeout_state.present_current
+            result.grasp_detected = timeout_state.grasp_detected
+            result.object_lost = timeout_state.object_lost
+            result.state = timeout_state
+            goal_handle.abort()
             return result
         except Exception as exc:  # noqa: BLE001
             result.success = False
@@ -423,81 +472,104 @@ class GripperServiceNode(Node):
 
     def _hold_current_position(self) -> GripperState:
         with self._bridge_lock:
-            bridge_state = self._bridge.read_state()
+            bridge_state = self._bridge.read_state(timeout_sec=self._state_poll_timeout)
             bridge_state = self._bridge.move_to(int(bridge_state.present_position), timeout_sec=1.0)
         return self._update_cached_state(bridge_state, 'holding current position')
 
     def _get_state(self, force_read: bool = False) -> GripperState:
         if force_read:
-            with self._bridge_lock:
-                bridge_state = self._bridge.read_state()
+            bridge_state = self._read_bridge_state()
             return self._update_cached_state(bridge_state, 'ok')
 
         with self._state_lock:
             if self._last_state is not None:
-                return self._last_state
+                return self._clone_state_msg(self._last_state)
 
-        with self._bridge_lock:
-            bridge_state = self._bridge.read_state()
+        bridge_state = self._read_bridge_state()
         return self._update_cached_state(bridge_state, 'ok')
 
+    def _read_bridge_state(self) -> BridgeState:
+        with self._bridge_lock:
+            return self._bridge.read_state(timeout_sec=self._state_poll_timeout)
+
     def _update_cached_state(self, bridge_state: BridgeState, status_text: str) -> GripperState:
-        msg = self._state_msg_from_bridge(bridge_state, status_text)
+        snapshot = self._semantic_evaluator.evaluate(
+            bridge_state,
+            goal_position=self._last_goal_position,
+            current_limit=self._goal_current,
+            status_text=status_text,
+        )
+        msg = self._state_msg_from_snapshot(snapshot)
         with self._state_lock:
-            self._last_state = msg
+            self._last_state = self._clone_state_msg(msg)
         return msg
 
-    def _state_msg_from_bridge(self, bridge_state: BridgeState, status_text: str) -> GripperState:
+    def _state_msg_from_snapshot(self, snapshot: SemanticStateSnapshot) -> GripperState:
         msg = GripperState()
         msg.stamp = self.get_clock().now().to_msg()
-        msg.ready = bool(bridge_state.torque_enabled)
-        msg.torque_enabled = bool(bridge_state.torque_enabled)
-        msg.moving = bool(bridge_state.moving)
-        msg.in_position = bool(bridge_state.in_position)
-        msg.status = int(bridge_state.status)
-        msg.moving_status = int(bridge_state.moving_status)
-        msg.present_position = int(bridge_state.present_position)
-        msg.goal_position = int(self._last_goal_position)
-        msg.present_current = int(bridge_state.present_current)
-        msg.current_limit = int(self._goal_current)
-        msg.present_velocity = int(bridge_state.present_velocity)
-        msg.present_temperature = int(bridge_state.present_temperature)
-        msg.grasp_detected = self._is_grasp_detected(bridge_state)
-        msg.object_lost = self._is_object_lost(bridge_state, msg.grasp_detected)
-        msg.status_text = status_text
+        msg.ready = snapshot.ready
+        msg.torque_enabled = snapshot.torque_enabled
+        msg.moving = snapshot.moving
+        msg.in_position = snapshot.in_position
+        msg.status = snapshot.status
+        msg.moving_status = snapshot.moving_status
+        msg.present_position = snapshot.present_position
+        msg.goal_position = snapshot.goal_position
+        msg.present_current = snapshot.present_current
+        msg.current_limit = snapshot.current_limit
+        msg.present_velocity = snapshot.present_velocity
+        msg.present_temperature = snapshot.present_temperature
+        msg.grasp_detected = snapshot.grasp_detected
+        msg.object_lost = snapshot.object_lost
+        msg.status_text = snapshot.status_text
         return msg
-
-    def _is_grasp_detected(self, bridge_state: BridgeState) -> bool:
-        if not bridge_state.torque_enabled or bridge_state.moving:
-            return False
-        current_abs = abs(int(bridge_state.present_current))
-        return current_abs >= self._grasp_current_threshold or current_abs >= int(self._goal_current * 0.9)
-
-    def _is_object_lost(self, bridge_state: BridgeState, grasp_detected: bool) -> bool:
-        if grasp_detected:
-            self._had_grasp = True
-            self._last_grasp_position = int(bridge_state.present_position)
-            return False
-        if not self._had_grasp or not bridge_state.torque_enabled:
-            return False
-        current_abs = abs(int(bridge_state.present_current))
-        if current_abs > self._object_lost_current_threshold:
-            return False
-        if self._last_grasp_position is None:
-            return True
-        position_delta = abs(int(bridge_state.present_position) - self._last_grasp_position)
-        return position_delta >= self._object_lost_position_delta
 
     def _last_state_or_empty(self, status_text: str) -> GripperState:
         with self._state_lock:
             if self._last_state is not None:
-                state = self._last_state
+                state = self._clone_state_msg(self._last_state)
+                state.stamp = self.get_clock().now().to_msg()
                 state.status_text = status_text
                 return state
         msg = GripperState()
         msg.stamp = self.get_clock().now().to_msg()
         msg.status_text = status_text
         return msg
+
+    def _clone_state_msg(self, state: GripperState) -> GripperState:
+        msg = GripperState()
+        msg.stamp = state.stamp
+        msg.ready = state.ready
+        msg.torque_enabled = state.torque_enabled
+        msg.moving = state.moving
+        msg.in_position = state.in_position
+        msg.grasp_detected = state.grasp_detected
+        msg.object_lost = state.object_lost
+        msg.status = state.status
+        msg.moving_status = state.moving_status
+        msg.present_position = state.present_position
+        msg.goal_position = state.goal_position
+        msg.present_current = state.present_current
+        msg.current_limit = state.current_limit
+        msg.present_velocity = state.present_velocity
+        msg.present_temperature = state.present_temperature
+        msg.status_text = state.status_text
+        return msg
+
+    def _build_safe_grasp_feedback(
+        self,
+        state_msg: GripperState,
+        current_delta: int,
+        grasp_detected: bool,
+    ) -> SafeGrasp.Feedback:
+        feedback = SafeGrasp.Feedback()
+        feedback.present_position = state_msg.present_position
+        feedback.present_current = state_msg.present_current
+        feedback.current_delta = int(current_delta)
+        feedback.grasp_detected = bool(grasp_detected)
+        feedback.object_lost = state_msg.object_lost
+        feedback.state = self._clone_state_msg(state_msg)
+        return feedback
 
     def _publish_joint_state(self, state_msg: GripperState) -> None:
         msg = JointState()
