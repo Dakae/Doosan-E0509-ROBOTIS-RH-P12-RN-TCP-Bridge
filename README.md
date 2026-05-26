@@ -179,7 +179,7 @@ is the recommended operational entrypoint.
 ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
   controller_host:=110.120.1.56 \
   namespace:=dsr01 \
-  service_prefix:=
+  #service_prefix:=(For this part, enter dsr_controller2 when using the ros2_jazzy, you can omit the ros2_humble)
 ```
 
 > **Startup `INITIALIZE` can fail a few times or take a while.** TCP may already
