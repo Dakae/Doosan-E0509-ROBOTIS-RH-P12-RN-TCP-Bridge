@@ -176,10 +176,13 @@ Use this node when another robot control node should command the gripper. This
 is the recommended operational entrypoint.
 
 ```bash
+# For ros2_jazzy, add:
+#   service_prefix:=dsr_controller2
+# For ros2_humble, this option can be omitted.
+
 ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
   controller_host:=110.120.1.56 \
-  namespace:=dsr01 \
-  #service_prefix:=(For this part, enter dsr_controller2 when using the ros2_jazzy, you can omit the ros2_humble)
+  namespace:=dsr01
 ```
 
 > **Startup `INITIALIZE` can fail a few times or take a while.** TCP may already
