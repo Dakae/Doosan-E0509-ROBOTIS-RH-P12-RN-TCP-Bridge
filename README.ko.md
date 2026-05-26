@@ -180,8 +180,8 @@ source install/setup.bash
 ```bash
 ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
   controller_host:=110.120.1.56 \
-  namespace:=dsr01 \
-  service_prefix:=
+  namespace:=dsr01
+  #service_prefix:=(이 부분은 jazzy 사용시 dsr_controller2 입력, humble은 생략해도 됨)
 ```
 
 > **시작 시 `INITIALIZE`가 몇 차례 실패하거나 오래 걸릴 수 있습니다.**
