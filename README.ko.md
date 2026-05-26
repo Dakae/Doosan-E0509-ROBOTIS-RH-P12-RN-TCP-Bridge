@@ -178,8 +178,9 @@ source install/setup.bash
 다른 로봇 제어 노드가 그리퍼를 제어해야 할 때 사용하는 권장 방식입니다.
 
 ```bash
-# ROS 2 Jazzy를 사용하는 경우 service_prefix 옵션을 추가하세요.
-# ROS 2 Humble을 사용하는 경우 해당 옵션은 생략할 수 있습니다.
+# ros2_jazzy를 사용하는 경우 다음 옵션을 추가하세요:
+#   service_prefix:=dsr_controller2
+# ros2_humble을 사용하는 경우 이 옵션은 생략할 수 있습니다.
 
 ros2 launch dsr_gripper_tcp gripper_service_node.launch.py \
   controller_host:=110.120.1.56 \
